@@ -1,5 +1,7 @@
-node_modules/
-outputs/
-*.log
+node_modules
 .env
-.DS_Store
+*.txt
+!package.json
+!bot.js
+!ua-helper.js
+!.gitignore
