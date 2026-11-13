@@ -5,13 +5,13 @@ const path = require('path');
 const express = require('express');
 
 // ==============================================
-// 🔑 BOT TOKEN — Set this in Render Dashboard later!
+// 🔑 BOT TOKEN — Set this in Render Dashboard!
 // ==============================================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_KEY = 'a1e486e2729f46d6bb368d6b2bcda326';
 const CONCURRENCY = 5;
 
-// Express health check — keeps bot alive on Render free tier
+// Express health check
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('✅ Spotify Checker Bot is Running!'));
@@ -54,7 +54,7 @@ async function checkEmail(email) {
       if (resJson.error && String(resJson.error).includes('already_exists')) {
         return { status: 'VALID', item: email };
       } else if (resJson.success) {
-        return { status: 'BAD', item: email };
+        return { status: 'DEAD', item: email };
       }
       return { status: 'UNKNOWN', item: email };
     } catch (err) {
@@ -104,11 +104,11 @@ bot.command('mode', (ctx) => {
 });
 
 bot.help((ctx) => {
-  ctx.reply(`📖 Use /mode to switch modes, then send your .txt file!\n\n⚡ Concurrency: ${CONCURRENCY} parallel checks`);
+  ctx.reply(`📖 Use /mode to switch modes, then send your .txt file!\n\n⚡ Concurrency: ${CONCURRENCY} parallel checks\n📊 Live counters enabled`);
 });
 
-async function processBatch(items, mode, onProgress) {
-  const valid = [], bad = [], unknown = [], errors = [];
+async function processBatch(items, mode, updateUI) {
+  const valid = [], dead = [], unknown = [], errors = [];
   let checked = 0;
 
   for (let i = 0; i < items.length; i += CONCURRENCY) {
@@ -122,16 +122,16 @@ async function processBatch(items, mode, onProgress) {
 
     for (const r of results) {
       if (r.status === 'VALID') valid.push(mode === 'emails' ? r.item : items.find(i => i.startsWith(r.item + ':')) || r.item);
-      else if (r.status === 'BAD') bad.push(mode === 'emails' ? r.item : items.find(i => i.startsWith(r.item + ':')) || r.item);
+      else if (r.status === 'DEAD') dead.push(mode === 'emails' ? r.item : items.find(i => i.startsWith(r.item + ':')) || r.item);
       else if (r.status === 'UNKNOWN') unknown.push(r.item);
       else errors.push(`${r.item} - ${r.error}`);
     }
 
     checked += batch.length;
-    onProgress(checked);
+    updateUI(checked, valid.length, dead.length, unknown.length, errors.length);
     await sleep(Math.floor(Math.random() * 40 + 10));
   }
-  return { valid, bad, unknown, errors };
+  return { valid, dead, unknown, errors };
 }
 
 bot.on('document', async (ctx) => {
@@ -158,34 +158,58 @@ bot.on('document', async (ctx) => {
     if (items.length === 0) return ctx.reply('❌ No valid entries found!');
 
     const total = items.length;
-    const progressMsg = await ctx.reply(`⏳ Progress: 0/${total} (0%)`);
+    const progressMsg = await ctx.reply(
+      `⏳ Progress: 0/${total} (0%)\n\n` +
+      `🟢 𝗟𝗶𝘃𝗲: 0\n` +
+      `🔴 𝗗𝗲𝗮𝗱: 0\n` +
+      `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: 0\n` +
+      `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: 0`
+    );
 
-    const results = await processBatch(items, mode, async (checked) => {
-      if (checked % 20 === 0 || checked === total) {
-        try {
-          await ctx.telegram.editMessageText(
-            ctx.chat.id, progressMsg.message_id, undefined,
-            `⏳ Progress: ${checked}/${total} (${Math.round((checked/total)*100)}%)`
-          );
-        } catch {}
-      }
-    });
+    const updateMessage = async (checked, v, d, u, e) => {
+      const percent = Math.round((checked / total) * 100);
+      try {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          progressMsg.message_id,
+          undefined,
+          `⏳ 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀: ${checked}/${total} (${percent}%)\n\n` +
+          `🟢 𝗟𝗶𝘃𝗲: ${v}\n` +
+          `🔴 𝗗𝗲𝗮𝗱: ${d}\n` +
+          `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: ${u}\n` +
+          `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: ${e}`
+        );
+      } catch {}
+    };
+
+    const results = await processBatch(items, mode, updateMessage);
 
     const summary = 
-      `✅ COMPLETE ✅\n\n📊 Total: ${total}\n🟢 Valid: ${results.valid.length}\n🔴 Bad: ${results.bad.length}\n🟡 Unknown: ${results.unknown.length}\n🔵 Errors: ${results.errors.length}`;
+      `✅ ✅ 𝗖𝗛𝗘𝗖𝗞 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 ✅ ✅\n\n` +
+      `📊 𝗧𝗼𝘁𝗮𝗹: ${total}\n` +
+      `🟢 𝗟𝗶𝘃𝗲: ${results.valid.length}\n` +
+      `🔴 𝗗𝗲𝗮𝗱: ${results.dead.length}\n` +
+      `🟡 𝗨𝗻𝗸𝗻𝗼𝘄𝗻: ${results.unknown.length}\n` +
+      `🔵 𝗘𝗿𝗿𝗼𝗿𝘀: ${results.errors.length}\n\n` +
+      `Made by: @PLANECLOUD | @DK_CE`;
     await ctx.reply(summary);
 
     const outputPath = path.join(__dirname, 'outputs');
     if (!fs.existsSync(outputPath)) fs.mkdirSync(outputPath);
 
-    fs.writeFileSync(path.join(outputPath, 'valid.txt'), results.valid.join('\n'));
-    fs.writeFileSync(path.join(outputPath, 'bad.txt'), results.bad.join('\n'));
+    fs.writeFileSync(path.join(outputPath, 'live.txt'), results.valid.join('\n'));
+    fs.writeFileSync(path.join(outputPath, 'dead.txt'), results.dead.join('\n'));
+    fs.writeFileSync(path.join(outputPath, 'unknown.txt'), results.unknown.join('\n'));
     fs.writeFileSync(path.join(outputPath, 'results.txt'),
-      `=== VALID ===\n${results.valid.join('\n')}\n\n=== BAD ===\n${results.bad.join('\n')}\n\n=== UNKNOWN ===\n${results.unknown.join('\n')}\n\n=== ERRORS ===\n${results.errors.join('\n')}`
+      `=== 𝗟𝗜𝗩𝗘 (${results.valid.length}) ===\n${results.valid.join('\n')}\n\n` +
+      `=== 𝗗𝗘𝗔𝗗 (${results.dead.length}) ===\n${results.dead.join('\n')}\n\n` +
+      `=== 𝗨𝗡𝗞𝗡𝗢𝗪𝗡 (${results.unknown.length}) ===\n${results.unknown.join('\n')}\n\n` +
+      `=== 𝗘𝗥𝗥𝗢𝗥𝗦 (${results.errors.length}) ===\n${results.errors.join('\n')}`
     );
 
-    await ctx.replyWithDocument({ source: path.join(outputPath, 'valid.txt'), filename: 'valid.txt' });
-    await ctx.replyWithDocument({ source: path.join(outputPath, 'bad.txt'), filename: 'bad.txt' });
+    await ctx.replyWithDocument({ source: path.join(outputPath, 'live.txt'), filename: 'live.txt' });
+    await ctx.replyWithDocument({ source: path.join(outputPath, 'dead.txt'), filename: 'dead.txt' });
+    await ctx.replyWithDocument({ source: path.join(outputPath, 'unknown.txt'), filename: 'unknown.txt' });
     await ctx.replyWithDocument({ source: path.join(outputPath, 'results.txt'), filename: 'results.txt' });
     await ctx.reply('📤 All results sent! ✅');
 
