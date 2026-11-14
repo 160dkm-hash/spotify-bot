@@ -1,7 +1,6 @@
 {
-  "name": "spotify-tg-bot",
-  "version": "1.2.0",
-  "description": "Spotify Email Validator — Telegram Bot",
+  "name": "spotify-checker",
+  "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
