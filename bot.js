@@ -16,7 +16,7 @@ const CONFIG = {
     'Cette adresse e-mail est déjà associée à un compte.'
   ],
   FAILURE_KEY: '"status":1',
-  DELAY: 1500,           // ⏱️ Milliseconds between checks — increase to go slower
+  DELAY: 1500,           // ⏱️ Milliseconds between checks
   BOT_TOKEN: process.env.BOT_TOKEN,
   OWNER_ID: process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : null
 };
@@ -102,113 +102,98 @@ const bot = new Telegraf(CONFIG.BOT_TOKEN);
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Auth Middleware
 bot.use((ctx, next) => {
-  if (!isOwner(ctx.from.id)) {
-    return ctx.reply('❌ Unauthorized — This bot is private');
-  }
+  if (!isOwner(ctx.from.id)) return ctx.reply('❌ Unauthorized');
   return next();
 });
 
 // ─── COMMANDS ───────────────────────────────────────────────────────
 bot.command('start', ctx => {
   ctx.replyWithMarkdown(`
-🎵 *Spotify Email Checker* — Slow & Steady Mode
+🎵 *Spotify Email Checker* — Quiet Mode
 
 *Commands:*
-/upload — Send your email list (.txt)
+/upload — Send email list (.txt)
 /proxies — Send proxy list (optional)
 /startcheck — Begin checking
 /stop — Stop immediately
-/panel — Show LIVE/DEAD/UNKNOWN counts
-/download — Download LIVE results
+/panel — Show current counts
 /clear — Reset counts & file
 
-*Format:* email:password per line
+✅ No spam — results sent as file when done
   `);
 });
 
-bot.command('panel', ctx => {
-  ctx.reply(panel());
-});
+bot.command('panel', ctx => ctx.reply(panel()));
+bot.command('stop', ctx => { isRunning = false; ctx.reply('🛑 Stopped.\n' + panel()); });
 
-bot.command('stop', ctx => {
-  isRunning = false;
-  ctx.reply('🛑 Stopped.\n' + panel());
-});
-
-bot.command('download', async ctx => {
-  if (!fs.existsSync(CONFIG.OUTPUT_FILE)) {
-    return ctx.reply('⚠️ No LIVE results yet. Run /startcheck first.');
-  }
-  await ctx.replyWithDocument({
-    source: CONFIG.OUTPUT_FILE,
-    filename: `LIVE_Emails_${Date.now()}.txt`
-  });
-});
-
-bot.command('upload', ctx => {
-  ctx.reply('📄 Send your email list as a .txt file\nFormat: email:password per line');
-});
-
-bot.command('proxies', ctx => {
-  ctx.reply('🕵️ Send your proxy list as a .txt file\nOne proxy per line');
-});
+bot.command('upload', ctx => ctx.reply('📄 Send your email list — one email:password per line'));
+bot.command('proxies', ctx => ctx.reply('🕵️ Send proxy list — one per line (optional)'));
 
 bot.command('clear', ctx => {
   liveCount = deadCount = unknownCount = 0;
   if (fs.existsSync(CONFIG.OUTPUT_FILE)) fs.unlinkSync(CONFIG.OUTPUT_FILE);
-  ctx.reply('🔄 Counts & file cleared.\n' + panel());
+  ctx.reply('🔄 Cleared.\n' + panel());
 });
 
 bot.command('startcheck', async ctx => {
-  if (isRunning) return ctx.reply('⚠️ Already running — use /stop first');
-  if (!fs.existsSync('mail.txt')) return ctx.reply('⚠️ Upload your list first with /upload');
+  if (isRunning) return ctx.reply('⚠️ Already running — /stop first');
+  if (!fs.existsSync('mail.txt')) return ctx.reply('⚠️ Upload list with /upload first');
 
-  // Reset counts
+  // Reset everything
   liveCount = deadCount = unknownCount = 0;
+  if (fs.existsSync(CONFIG.OUTPUT_FILE)) fs.unlinkSync(CONFIG.OUTPUT_FILE);
   isRunning = true;
 
   const proxies = loadProxies();
   const entries = fs.readFileSync('mail.txt', 'utf8')
     .split(/\r?\n/).map(l => l.trim()).filter(l => l);
 
-  await ctx.reply(`🚀 Starting — ${entries.length} emails\n${panel()}`);
+  const msg = await ctx.reply(`🚀 Started — ${entries.length} emails\n${panel()}`);
 
-  for (const entry of entries) {
-    if (!isRunning) break;
-
-    const [email, pass = ''] = entry.split(':');
+  for (let i = 0; i < entries.length && isRunning; i++) {
+    const [email, pass = ''] = entries[i].split(':');
     if (!email) continue;
 
-    const proxy = getProxy(proxies);
-    const result = await checkEmail(email, proxy);
+    const result = await checkEmail(email, getProxy(proxies));
 
     if (result === 'LIVE') {
       liveCount++;
       saveLive(email, pass);
-      await ctx.reply(`✅ 𝗟𝗜𝗩𝗘 — ${email}`);
     } else if (result === 'DEAD') {
       deadCount++;
     } else {
       unknownCount++;
-      await ctx.reply(`⚠️ 𝗨𝗡𝗞𝗡𝗢𝗪𝗡 — ${email}`);
     }
 
-    // Update panel every 10 emails or on last one
-    const total = liveCount + deadCount + unknownCount;
-    if (total % 10 === 0 || total === entries.length) {
-      await ctx.reply(panel());
+    // Update panel every 20 emails — no individual messages
+    if ((i + 1) % 20 === 0 || i === entries.length - 1) {
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+        `🚀 Progress: ${i + 1}/${entries.length}\n${panel()}`
+      ).catch(() => ctx.reply(panel())); // fallback if edit fails
     }
 
     await delay(CONFIG.DELAY);
   }
 
   isRunning = false;
-  await ctx.reply(`🏁 FINISHED!\nChecked: ${entries.length}\n${panel()}`);
+
+  // Final summary + send file
+  await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+    `🏁 FINISHED!\nChecked: ${entries.length}\n${panel()}`
+  ).catch(() => {});
+
+  if (liveCount > 0 && fs.existsSync(CONFIG.OUTPUT_FILE)) {
+    await ctx.replyWithDocument({
+      source: CONFIG.OUTPUT_FILE,
+      filename: `LIVE_Results_${Date.now()}.txt`
+    });
+  } else {
+    await ctx.reply('✅ Done — No LIVE emails found.');
+  }
 });
 
-// ─── FILE UPLOAD HANDLER ────────────────────────────────────────────
+// ─── FILE UPLOAD ────────────────────────────────────────────────────
 bot.on('document', async ctx => {
   const doc = ctx.message.document;
   try {
@@ -221,29 +206,27 @@ bot.on('document', async ctx => {
       ctx.reply(`✅ ${lines.length} proxies saved`);
     } else {
       fs.writeFileSync('mail.txt', lines.join('\n'));
-      ctx.reply(`✅ ${lines.length} emails saved — ready when you are!`);
+      ctx.reply(`✅ ${lines.length} emails saved — ready`);
     }
   } catch {
-    ctx.reply('❌ Failed to read file — try again');
+    ctx.reply('❌ Failed to read file');
   }
 });
 
-// ─── HEALTH CHECK FOR RENDER ────────────────────────────────────────
-app.get('/', (_, res) => res.send('🎵 Spotify Checker — Bot Online'));
+// ─── HEALTH CHECK ──────────────────────────────────────────────────
+app.get('/', (_, res) => res.send('🎵 Bot Online'));
 app.get('/health', (_, res) => res.json({ ok: true, running: isRunning }));
-app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Health check on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Port ${PORT}`));
 
-// ─── START BOT WITH 409 FIX ─────────────────────────────────────────
-// 3-second delay ensures old instance fully stops before new one connects
+// ─── START BOT ─────────────────────────────────────────────────────
 setTimeout(() => {
   bot.launch({ polling: true })
-    .then(() => console.log('🤖 Bot Online — Ready'))
+    .then(() => console.log('🤖 Bot Online'))
     .catch(err => {
-      console.error('❌ Bot launch failed:', err.message);
+      console.error('❌ Bot error:', err.message);
       process.exit(1);
     });
 }, 3000);
 
-// Graceful Shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
