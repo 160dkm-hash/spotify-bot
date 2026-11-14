@@ -6,7 +6,7 @@ const express = require('express');
 const { Telegraf } = require('telegraf');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// ⚙️ CONFIG
+// ⚙️ CONFIGURATION
 const CONFIG = {
   API_URL: 'https://spclient.wg.spotify.com/signup/public/v1/account?validate=1&email=',
   OUTPUT_FILE: 'Spotify VM.txt',
@@ -16,7 +16,7 @@ const CONFIG = {
     'Cette adresse e-mail est déjà associée à un compte.'
   ],
   FAILURE_KEY: '"status":1',
-  DELAY: 1200,           // ⏱️ Delay between checks in ms — increase if too fast
+  DELAY: 1500,           // ⏱️ Milliseconds between checks — increase to go slower
   BOT_TOKEN: process.env.BOT_TOKEN,
   OWNER_ID: process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : null
 };
@@ -28,7 +28,7 @@ const UA_LIST = [
 ];
 const randomUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 
-// 📊 STATS
+// 📊 LIVE STATS
 let isRunning = false;
 let liveCount = 0;
 let deadCount = 0;
@@ -102,8 +102,15 @@ const bot = new Telegraf(CONFIG.BOT_TOKEN);
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-bot.use((ctx, next) => isOwner(ctx.from.id) ? next() : ctx.reply('❌ Unauthorized'));
+// Auth Middleware
+bot.use((ctx, next) => {
+  if (!isOwner(ctx.from.id)) {
+    return ctx.reply('❌ Unauthorized — This bot is private');
+  }
+  return next();
+});
 
+// ─── COMMANDS ───────────────────────────────────────────────────────
 bot.command('start', ctx => {
   ctx.replyWithMarkdown(`
 🎵 *Spotify Email Checker* — Slow & Steady Mode
@@ -111,10 +118,11 @@ bot.command('start', ctx => {
 *Commands:*
 /upload — Send your email list (.txt)
 /proxies — Send proxy list (optional)
-/start — Begin checking
+/startcheck — Begin checking
 /stop — Stop immediately
-/panel — Show current counts
-/download — Save LIVE results
+/panel — Show LIVE/DEAD/UNKNOWN counts
+/download — Download LIVE results
+/clear — Reset counts & file
 
 *Format:* email:password per line
   `);
@@ -131,7 +139,7 @@ bot.command('stop', ctx => {
 
 bot.command('download', async ctx => {
   if (!fs.existsSync(CONFIG.OUTPUT_FILE)) {
-    return ctx.reply('⚠️ No LIVE results yet. Run /start first.');
+    return ctx.reply('⚠️ No LIVE results yet. Run /startcheck first.');
   }
   await ctx.replyWithDocument({
     source: CONFIG.OUTPUT_FILE,
@@ -153,7 +161,7 @@ bot.command('clear', ctx => {
   ctx.reply('🔄 Counts & file cleared.\n' + panel());
 });
 
-bot.command('start', async ctx => {
+bot.command('startcheck', async ctx => {
   if (isRunning) return ctx.reply('⚠️ Already running — use /stop first');
   if (!fs.existsSync('mail.txt')) return ctx.reply('⚠️ Upload your list first with /upload');
 
@@ -193,14 +201,14 @@ bot.command('start', async ctx => {
       await ctx.reply(panel());
     }
 
-    await delay(CONFIG.DELAY); // ⏱️ Slow it down
+    await delay(CONFIG.DELAY);
   }
 
   isRunning = false;
   await ctx.reply(`🏁 FINISHED!\nChecked: ${entries.length}\n${panel()}`);
 });
 
-// Handle file uploads
+// ─── FILE UPLOAD HANDLER ────────────────────────────────────────────
 bot.on('document', async ctx => {
   const doc = ctx.message.document;
   try {
@@ -220,13 +228,22 @@ bot.on('document', async ctx => {
   }
 });
 
-// Health check
-app.get('/', (_, res) => res.send('🎵 Bot Online — use Telegram'));
+// ─── HEALTH CHECK FOR RENDER ────────────────────────────────────────
+app.get('/', (_, res) => res.send('🎵 Spotify Checker — Bot Online'));
 app.get('/health', (_, res) => res.json({ ok: true, running: isRunning }));
-app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Health check on port ${PORT}`));
 
-// Start bot
-bot.launch({ polling: true }).then(() => console.log('🤖 Bot Online'));
+// ─── START BOT WITH 409 FIX ─────────────────────────────────────────
+// 3-second delay ensures old instance fully stops before new one connects
+setTimeout(() => {
+  bot.launch({ polling: true })
+    .then(() => console.log('🤖 Bot Online — Ready'))
+    .catch(err => {
+      console.error('❌ Bot launch failed:', err.message);
+      process.exit(1);
+    });
+}, 3000);
 
+// Graceful Shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
