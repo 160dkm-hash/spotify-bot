@@ -6,7 +6,7 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// ⚙️ CONFIGURATION
+// ⚙️ CONFIGURATION — Increased stability settings
 const CONFIG = {
   API_URL: 'https://spclient.wg.spotify.com/signup/public/v1/account?validate=1&email=',
   OUTPUT_FILE: 'Spotify VM.txt',
@@ -16,7 +16,9 @@ const CONFIG = {
     'Cette adresse e-mail est déjà associée à un compte.'
   ],
   FAILURE_KEY: '"status":1',
-  DELAY: 1200,           // ⏱️ Milliseconds between each email
+  DELAY: 1000,           // ⏱️ Balanced — not too fast, not too slow
+  MAX_RETRIES: 2,        // 🔄 Retry failed checks
+  REQUEST_TIMEOUT: 20000, // ⏳ Longer timeout per request
   BOT_TOKEN: process.env.BOT_TOKEN,
   OWNER_ID: process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : null
 };
@@ -24,7 +26,9 @@ const CONFIG = {
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
 ];
 const randomUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 
@@ -33,6 +37,7 @@ let isRunning = false;
 let liveCount = 0;
 let deadCount = 0;
 let unknownCount = 0;
+let errorCount = 0;
 
 const isOwner = (id) => CONFIG.OWNER_ID === null || id === CONFIG.OWNER_ID;
 
@@ -42,43 +47,65 @@ function loadProxies() {
     .split(/\r?\n/).map(l => l.trim()).filter(l => l);
 }
 
-function getProxy(proxyList) {
+function getProxy(proxyList, failedProxies) {
   if (!proxyList.length) return undefined;
-  return proxyList[Math.floor(Math.random() * proxyList.length)];
+  const available = proxyList.filter(p => !failedProxies.has(p));
+  if (available.length === 0) { failedProxies.clear(); return proxyList[Math.floor(Math.random() * proxyList.length)]; }
+  return available[Math.floor(Math.random() * available.length)];
 }
 
 async function checkEmail(email, proxy) {
-  const url = `${CONFIG.API_URL}${encodeURIComponent(email)}`;
-  const options = {
-    headers: {
-      'User-Agent': randomUA(),
-      'Accept': '*/*',
-      'Pragma': 'no-cache'
-    },
-    timeout: 15000,
-    rejectUnauthorized: true
-  };
-  if (proxy) options.agent = new HttpsProxyAgent(proxy);
+  for (let attempt = 0; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+    const url = `${CONFIG.API_URL}${encodeURIComponent(email)}`;
+    const options = {
+      headers: {
+        'User-Agent': randomUA(),
+        'Accept': '*/*',
+        'Pragma': 'no-cache',
+        'Cache-Control': 'no-cache'
+      },
+      timeout: CONFIG.REQUEST_TIMEOUT,
+      rejectUnauthorized: true
+    };
+    if (proxy) options.agent = new HttpsProxyAgent(proxy);
 
-  return new Promise((resolve) => {
-    const req = https.get(url, options, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        for (const key of CONFIG.SUCCESS_KEYS) {
-          if (body.includes(key)) return resolve('LIVE');
-        }
-        if (body.includes(CONFIG.FAILURE_KEY)) return resolve('DEAD');
-        resolve('UNKNOWN');
+    try {
+      const result = await new Promise((resolve) => {
+        const req = https.get(url, options, (res) => {
+          let body = '';
+          res.on('data', c => body += c);
+          res.on('end', () => {
+            for (const key of CONFIG.SUCCESS_KEYS) {
+              if (body.includes(key)) return resolve('LIVE');
+            }
+            if (body.includes(CONFIG.FAILURE_KEY)) return resolve('DEAD');
+            resolve('UNKNOWN');
+          });
+        });
+        req.on('error', (err) => {
+          resolve(`ERROR:${err.code || 'NETWORK'}`);
+        });
+        req.end();
       });
-    });
-    req.on('error', () => resolve('UNKNOWN'));
-    req.end();
-  });
+
+      if (result.startsWith('ERROR')) {
+        if (attempt >= CONFIG.MAX_RETRIES) return 'UNKNOWN';
+        await delay(500);
+        continue;
+      }
+      return result;
+    } catch {
+      if (attempt >= CONFIG.MAX_RETRIES) return 'UNKNOWN';
+      await delay(500);
+    }
+  }
+  return 'UNKNOWN';
 }
 
 function saveLive(email, pass) {
-  fs.appendFileSync(CONFIG.OUTPUT_FILE, `${email}:${pass || ''}\n`, 'utf8');
+  try {
+    fs.appendFileSync(CONFIG.OUTPUT_FILE, `${email}:${pass || ''}\n`, 'utf8');
+  } catch {}
 }
 
 // 📊 Progress Bar & Panel
@@ -87,10 +114,10 @@ function progressBar(current, total) {
   const barLength = 15;
   const filled = Math.round((percent / 100) * barLength);
   const bar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
-  return `${bar} ${percent}%`;
+  return `${bar} ${String(percent).padStart(3)}%`;
 }
 
-function fullPanel(current, total) {
+function fullPanel(current, total, note = '') {
   return `
 <b>╔══════════════════════════════════════╗
 ║        🎵 SPOTIFY CHECKER 🎵           ║
@@ -101,6 +128,7 @@ function fullPanel(current, total) {
 ║  ✅  LIVE:    ${String(liveCount).padEnd(3)}                  ║
 ║  ❌  DEAD:    ${String(deadCount).padEnd(3)}                  ║
 ║  ⚠️  UNKNOWN: ${String(unknownCount).padEnd(3)}                  ║
+${note ? `║  ℹ️  ${note.padEnd(30)}║` : ''}
 ╚══════════════════════════════════════╝</b>
 `;
 }
@@ -154,7 +182,7 @@ bot.hears('📤 Upload List', ctx => ctx.reply('📄 Send your email list as a .
 bot.hears('🕵️ Proxies', ctx => ctx.reply('🕵️ Send your proxy list as a .txt file\nOne proxy per line (optional)'));
 bot.hears('📊 Panel', ctx => ctx.replyWithHTML(fullPanel(0, 0)));
 bot.hears('🧹 Clear', ctx => {
-  liveCount = deadCount = unknownCount = 0;
+  liveCount = deadCount = unknownCount = errorCount = 0;
   if (fs.existsSync(CONFIG.OUTPUT_FILE)) fs.unlinkSync(CONFIG.OUTPUT_FILE);
   ctx.replyWithHTML('🔄 <b>Cleared!</b>\n' + fullPanel(0, 0));
 });
@@ -162,7 +190,7 @@ bot.hears('🛑 Stop', ctx => { isRunning = false; ctx.reply('🛑 <b>Stopped.</
 
 bot.hears('📥 Download', async ctx => {
   if (!fs.existsSync(CONFIG.OUTPUT_FILE)) {
-    return ctx.reply('⚠️ No LIVE results yet. Run a check first!');
+    return ctx.replyWithHTML(fullPanel(0, 0, 'No results yet'));
   }
   await ctx.replyWithDocument({
     source: CONFIG.OUTPUT_FILE,
@@ -171,15 +199,18 @@ bot.hears('📥 Download', async ctx => {
 });
 
 bot.hears('🚀 Start Check', async ctx => {
-  if (isRunning) return ctx.reply('⚠️ Already running — press 🛑 Stop first');
-  if (!fs.existsSync('mail.txt')) return ctx.reply('⚠️ Upload your list first using 📤 Upload List');
+  if (isRunning) return ctx.replyWithHTML(fullPanel(0, 0, 'Already running'));
+  if (!fs.existsSync('mail.txt')) {
+    return ctx.replyWithHTML(fullPanel(0, 0, 'Use 📤 Upload List first'));
+  }
 
   // Reset everything
-  liveCount = deadCount = unknownCount = 0;
+  liveCount = deadCount = unknownCount = errorCount = 0;
   if (fs.existsSync(CONFIG.OUTPUT_FILE)) fs.unlinkSync(CONFIG.OUTPUT_FILE);
   isRunning = true;
 
   const proxies = loadProxies();
+  const failedProxies = new Set();
   const entries = fs.readFileSync('mail.txt', 'utf8')
     .split(/\r?\n/).map(l => l.trim()).filter(l => l);
 
@@ -191,12 +222,16 @@ bot.hears('🚀 Start Check', async ctx => {
 ${fullPanel(0, entries.length)}
   `);
 
-  // Check ONE at a time — update progress every single one
+  let lastEditTime = 0;
+  const MIN_EDIT_INTERVAL = 1500; // ⏳ Prevent Telegram flood limits
+
+  // Check ONE at a time — with error protection
   for (let i = 0; i < entries.length && isRunning; i++) {
     const [email, pass = ''] = entries[i].split(':');
     if (!email) continue;
 
-    const result = await checkEmail(email, getProxy(proxies));
+    const proxy = getProxy(proxies, failedProxies);
+    const result = await checkEmail(email, proxy);
 
     if (result === 'LIVE') {
       liveCount++;
@@ -207,11 +242,22 @@ ${fullPanel(0, entries.length)}
       unknownCount++;
     }
 
-    // Update progress bar EVERY email — but not too fast for Telegram
-    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
-      `🚀 <b>CHECKING...</b>\n${fullPanel(i + 1, entries.length)}`,
-      { parse_mode: 'HTML' }
-    ).catch(() => {});
+    // Update progress — but not too fast for Telegram
+    const now = Date.now();
+    if (now - lastEditTime >= MIN_EDIT_INTERVAL || i === entries.length - 1) {
+      try {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          msg.message_id,
+          null,
+          `🚀 <b>CHECKING...</b>\n${fullPanel(i + 1, entries.length)}`,
+          { parse_mode: 'HTML' }
+        );
+        lastEditTime = now;
+      } catch {
+        // Silently skip edit errors — keep checking
+      }
+    }
 
     await delay(CONFIG.DELAY);
   }
@@ -219,10 +265,15 @@ ${fullPanel(0, entries.length)}
   isRunning = false;
 
   // Final message
-  await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
-    `🏁 <b>FINISHED!</b>\n${fullPanel(entries.length, entries.length)}`,
-    { parse_mode: 'HTML' }
-  ).catch(() => {});
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      msg.message_id,
+      null,
+      `🏁 <b>FINISHED!</b>\n${fullPanel(entries.length, entries.length)}`,
+      { parse_mode: 'HTML' }
+    );
+  } catch {}
 
   // Send results file
   if (liveCount > 0 && fs.existsSync(CONFIG.OUTPUT_FILE)) {
@@ -231,7 +282,7 @@ ${fullPanel(0, entries.length)}
       filename: `LIVE_Results_${Date.now()}.txt`
     });
   } else {
-    await ctx.reply('✅ Done — No LIVE emails found.');
+    await ctx.replyWithHTML(fullPanel(entries.length, entries.length, 'No LIVE found'));
   }
 });
 
@@ -257,7 +308,7 @@ bot.on('document', async ctx => {
 
 // ─── HEALTH CHECK ──────────────────────────────────────────────────
 app.get('/', (_, res) => res.send('🎵 Bot Online'));
-app.get('/health', (_, res) => res.json({ ok: true, running: isRunning }));
+app.get('/health', (_, res) => res.json({ ok: true, running: isRunning, checked: liveCount + deadCount + unknownCount }));
 app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Port ${PORT}`));
 
 // ─── START BOT ─────────────────────────────────────────────────────
